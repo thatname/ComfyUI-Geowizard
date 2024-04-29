@@ -213,7 +213,8 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
             uncertainty=pred_uncert,
         )
     
-    def __encode_img_embed(self, rgb):
+    @torch.no_grad()
+    def encode_img_embed(self, rgb):
         """
         Encode clip embeddings for img
         """
@@ -229,7 +230,7 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
         img_in_proc = ((img_in_proc.float() - clip_image_mean) / clip_image_std).to(self.dtype)        
         img_embed = self.image_encoder(img_in_proc).image_embeds.unsqueeze(1).to(self.dtype)
 
-        self.img_embed = img_embed
+        return img_embed
 
         
     @torch.no_grad()
@@ -252,10 +253,10 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
         rgb_latent = rgb_latent.repeat(2,1,1,1)
 
         # Batched img embedding
-        if self.img_embed is None:
-            self.__encode_img_embed(input_rgb)
         
-        batch_img_embed = self.img_embed.repeat(
+        img_embed = self.encode_img_embed(input_rgb)
+        
+        batch_img_embed = img_embed.repeat(
             (rgb_latent.shape[0], 1, 1)
         )  # [B, 1, 768]
 
@@ -310,7 +311,66 @@ class DepthNormalEstimationPipeline(DiffusionPipeline):
 
         return depth, normal
         
-    
+    @torch.no_grad()
+    def latent_sample(self,device,rgb_latent:torch.Tensor,
+                    img_embed:torch.Tensor,
+                     num_inference_steps:int,
+                     domain:str,
+                     show_pbar:bool,):
+
+        # Set timesteps: inherit from the diffuison pipeline
+        self.scheduler.set_timesteps(num_inference_steps, device=device) # here the numbers of the steps is only 10.
+        timesteps = self.scheduler.timesteps  # [T]
+        
+        # Initial geometric maps (Guassian noise)
+        geo_latent = torch.randn(rgb_latent.shape, device=device, dtype=self.dtype).repeat(2,1,1,1)
+        rgb_latent = rgb_latent.repeat(2,1,1,1).to(device) * self.latent_scale_factor
+
+        batch_img_embed = img_embed.repeat(
+            (rgb_latent.shape[0], 1, 1)
+        )  # [B, 1, 768]
+
+        # hybrid hierarchical switcher 
+        geo_class = torch.tensor([[0., 1.], [1, 0]], device=device, dtype=self.dtype)
+        geo_embedding = torch.cat([torch.sin(geo_class), torch.cos(geo_class)], dim=-1)
+        
+        if domain == "indoor":
+            domain_class = torch.tensor([[1., 0., 0]], device=device, dtype=self.dtype).repeat(2,1)
+        elif domain == "outdoor":
+            domain_class = torch.tensor([[0., 1., 0]], device=device, dtype=self.dtype).repeat(2,1)
+        elif domain == "object":
+            domain_class = torch.tensor([[0., 0., 1]], device=device, dtype=self.dtype).repeat(2,1)
+        domain_embedding = torch.cat([torch.sin(domain_class), torch.cos(domain_class)], dim=-1)
+
+        class_embedding = torch.cat((geo_embedding, domain_embedding), dim=-1)
+
+        # Denoising loop
+        if show_pbar:
+            iterable = tqdm(
+                enumerate(timesteps),
+                total=len(timesteps),
+                leave=False,
+                desc=" " * 4 + "Diffusion denoising",
+            )
+        else:
+            iterable = enumerate(timesteps)
+        
+        #pbar_2 = comfy.utils.ProgressBar(len(timesteps))
+        for i, t in iterable:
+            unet_input = torch.cat([rgb_latent, geo_latent], dim=1)
+
+            # predict the noise residual
+            noise_pred = self.unet(
+                unet_input, t.repeat(2), encoder_hidden_states=batch_img_embed, class_labels=class_embedding
+            ).sample  # [B, 4, h, w]
+
+            # compute the previous noisy sample x_t -> x_t-1
+            geo_latent = self.scheduler.step(noise_pred, t, geo_latent).prev_sample
+            #pbar_2.update(1)
+        geo_latent /= self.latent_scale_factor
+        torch.cuda.empty_cache()
+        return geo_latent[0][None], geo_latent[1][None]
+        
     def encode_RGB(self, rgb_in: torch.Tensor) -> torch.Tensor:
         """
         Encode RGB image into latent.
